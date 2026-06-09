@@ -1997,3 +1997,323 @@ The single most impactful change is **stopping the fetch-on-every-page-load patt
 ---
 
 *Document version: 4.0 — June 9, 2026*
+
+---
+
+---
+
+# Stage 5: Bulk Notification Design — Reliability, Failure Handling & Redesign
+
+> **Context:** It is placement season. The HR clicks "Notify All" and 50,000 students must receive an email and an in-app notification simultaneously. The proposed pseudocode implementation has critical shortcomings. This section diagnoses every flaw, answers the design questions, and delivers a redesigned reliable implementation.
+
+---
+
+## 1. The Original Pseudocode
+
+```
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)   # calls Email API
+        save_to_db(student_id, message)   # DB insert
+        push_to_app(student_id, message)  # SSE push
+```
+
+---
+
+## 2. Shortcomings of This Implementation
+
+### Problem 1: Synchronous Loop Over 50,000 Students
+
+The loop processes one student at a time, sequentially. Each iteration makes three blocking calls — an external email API, a database insert, and an SSE push — before moving to the next student.
+
+**Time estimate:**
+```
+50,000 students
+× (email API ~300ms + DB insert ~10ms + SSE push ~5ms)
+= 50,000 × 315ms
+= ~15,750 seconds ≈ 4.4 hours
+```
+
+The HR clicks "Notify All" and waits **four and a half hours** for the function to complete, blocking the entire process in a single thread the entire time. This is completely unacceptable.
+
+---
+
+### Problem 2: No Error Handling — One Failure Corrupts Everything
+
+There is no `try/catch` anywhere. If `send_email` throws an exception for student 5,000, the entire loop crashes. Students 5,001 to 50,000 receive nothing — no email, no DB record, no in-app notification. There is no way to know which students were notified and which were not without manually inspecting logs.
+
+The logs already confirmed this happened: **200 students' emails failed midway** and the system had no recovery mechanism.
+
+---
+
+### Problem 3: DB and Email Are Coupled in the Same Transaction
+
+`save_to_db` and `send_email` are called back to back in the same loop iteration with no coordination. This creates two dangerous inconsistency scenarios:
+
+- **Email sent, DB insert fails:** The student receives an email but there is no notification record in the database. The in-app notification never appears. The student is confused.
+- **DB insert succeeds, email fails:** The notification exists in the database but the student never received the email. The system thinks the student was notified; the student was not.
+
+These are **split-brain states** — the email system and the database disagree on what happened.
+
+---
+
+### Problem 4: Email API Rate Limits Will Be Breached
+
+Every email provider (SendGrid, AWS SES, Mailgun) enforces rate limits — typically 100–1,000 emails per second. Hammering the email API with 50,000 requests as fast as the loop runs will trigger rate limit errors (`429 Too Many Requests`), causing widespread failures. The original code has no rate limiting, no backoff, and no retry logic.
+
+---
+
+### Problem 5: SSE Push Is Not Reliable for Bulk Delivery
+
+Calling `push_to_app` per student inside a synchronous loop assumes every student has an active SSE connection at that exact moment. Most students will not — they may be offline, on a different tab, or their connection may have dropped. SSE is a real-time delivery mechanism, not a persistence mechanism. Sending via SSE without saving to the DB first means offline students miss the notification entirely.
+
+---
+
+### Problem 6: No Idempotency — Retrying Causes Duplicates
+
+If the process crashes at student 30,000 and is restarted, the loop starts from the beginning. Students 1–30,000 receive duplicate emails and get duplicate DB records. There is no mechanism to track which students have already been successfully notified.
+
+---
+
+## 3. Should DB Save and Email Send Happen Together?
+
+**No. They must be deliberately decoupled — but coordinated.**
+
+Here is the reasoning:
+
+The database insert and the email send are operations across two different systems — your PostgreSQL database and an external email provider. There is no distributed transaction that spans both. You cannot `COMMIT` a DB row and an email send atomically — one can succeed while the other fails, and there is no rollback for a sent email.
+
+The correct pattern is **"write first, deliver asynchronously"**:
+
+1. **Save to DB first** — this is your source of truth. If the DB write succeeds, the notification officially exists. This operation is fast, reliable, and within your control.
+2. **Publish a delivery event to a queue** — do not call the email API directly. Write a job to a message queue (e.g. RabbitMQ, Kafka, Redis Streams). This is also fast and reliable.
+3. **A worker reads from the queue and sends the email** — separately, asynchronously, with retry logic, rate limiting, and idempotency checks.
+
+This decoupling means:
+- The DB is always the authoritative record of what notifications exist
+- Email delivery is best-effort with retries — temporary email API failures do not corrupt the DB
+- If the email worker fails, the job stays in the queue and is retried — no data is lost
+- The DB and email states can be reconciled at any time by replaying queue events
+
+---
+
+## 4. What Happens to the 200 Failed Emails?
+
+With the original implementation: **they are lost**. No record of the failure, no retry, no way to identify which 200 students were affected without manual log parsing.
+
+With the redesigned implementation:
+- Every delivery attempt is recorded in a `notification_delivery_log` table with status `PENDING`, `SENT`, or `FAILED`
+- Failed jobs remain in the queue with an exponential backoff retry schedule
+- A dead-letter queue (DLQ) catches jobs that fail after maximum retries
+- An admin endpoint can query all `FAILED` deliveries and trigger a targeted re-send for exactly those 200 students — no duplicates to the 49,800 who succeeded
+
+---
+
+## 5. Redesigned Implementation
+
+### 5.1 Architecture Overview
+
+```
+HR clicks "Notify All"
+        │
+        ▼
+  API Handler
+  ├── Validate request
+  ├── INSERT bulk_notification_job (DB)
+  └── Enqueue 50,000 jobs → Message Queue
+        │
+        ▼
+  Job Queue (e.g. RabbitMQ / Redis Streams)
+  [job_1: student_1] [job_2: student_2] ... [job_50000: student_50000]
+        │
+        ▼
+  Worker Pool (N parallel workers)
+  Each worker:
+  ├── Dequeue one job
+  ├── Check idempotency (already processed?)
+  ├── save_to_db(student_id, message)
+  ├── send_email(student_id, message)  ← with retry + rate limit
+  ├── push_to_app(student_id, message) ← SSE if connected
+  └── Mark job DONE / FAILED
+        │
+        ▼
+  Dead Letter Queue (for jobs that fail after max retries)
+        │
+        ▼
+  Admin can inspect + re-trigger failed jobs
+```
+
+---
+
+### 5.2 Revised Pseudocode
+
+```
+# ─────────────────────────────────────────────
+# STEP 1: API Handler — called when HR clicks "Notify All"
+# Fast, returns immediately. Does NOT send anything.
+# ─────────────────────────────────────────────
+
+function handle_notify_all(student_ids: array, message: string):
+    job_id = generate_uuid()
+
+    # Record the bulk job in DB for tracking and audit
+    save_bulk_job_to_db(job_id, student_ids.length, status="PENDING")
+
+    # Enqueue one lightweight job per student into the message queue
+    # This is fast — just writing job metadata, not sending anything
+    for student_id in student_ids:
+        enqueue(queue="notifications.bulk", payload={
+            job_id:     job_id,
+            student_id: student_id,
+            message:    message,
+            attempt:    1
+        })
+
+    # Return immediately to the HR user — do not wait for delivery
+    return { job_id: job_id, status: "queued", student_count: 50000 }
+
+
+# ─────────────────────────────────────────────
+# STEP 2: Worker — runs in parallel, N instances
+# Each worker independently processes one job at a time
+# ─────────────────────────────────────────────
+
+function process_notification_job(job):
+    student_id = job.student_id
+    message    = job.message
+    job_id     = job.job_id
+
+    # Idempotency check — skip if already successfully processed
+    # Prevents duplicates on retry or restart
+    if already_processed(job_id, student_id):
+        ack(job)   # remove from queue, do nothing
+        return
+
+    db_saved   = false
+    email_sent = false
+
+    # ── Save to DB first (source of truth) ──
+    try:
+        save_to_db(student_id, message, job_id)
+        db_saved = true
+    catch DatabaseException as e:
+        log_failure(job_id, student_id, "DB_INSERT_FAILED", e)
+        nack(job, requeue=true)   # return to queue for retry
+        return
+
+    # ── Send email (external, fallible) ──
+    try:
+        send_email_with_retry(
+            student_id = student_id,
+            message    = message,
+            max_retries = 3,
+            backoff     = exponential   # 1s, 2s, 4s
+        )
+        email_sent = true
+    catch RateLimitException as e:
+        requeue_with_delay(job, delay_seconds=30)   # back off, try later
+        return
+    catch EmailApiException as e:
+        log_failure(job_id, student_id, "EMAIL_FAILED", e)
+        # DB record exists — student will see in-app notification
+        # Email failure is recorded; admin can re-trigger
+
+    # ── Push real-time in-app notification (best-effort) ──
+    # SSE is fire-and-forget — failure here does not affect DB or email
+    try:
+        push_to_app(student_id, message)
+    catch Exception as e:
+        log_warning(job_id, student_id, "SSE_PUSH_FAILED", e)
+        # Non-fatal: student will see notification on next page load from DB
+
+    # ── Mark job complete ──
+    mark_processed(job_id, student_id,
+                   db_saved=db_saved,
+                   email_sent=email_sent)
+    ack(job)
+
+
+# ─────────────────────────────────────────────
+# STEP 3: Dead Letter Queue Handler
+# Called for jobs that have failed max_retries times
+# ─────────────────────────────────────────────
+
+function handle_dead_letter(job):
+    log_permanent_failure(job.job_id, job.student_id)
+    alert_admin(job)   # notify the platform team
+    # Job is preserved in DLQ — admin can inspect and manually re-trigger
+
+
+# ─────────────────────────────────────────────
+# STEP 4: Re-send endpoint for failed deliveries
+# HR or admin triggers this to retry only the failed students
+# ─────────────────────────────────────────────
+
+function retry_failed_emails(job_id: string):
+    failed_students = query_db(
+        "SELECT student_id FROM notification_delivery_log
+         WHERE job_id = :job_id AND email_sent = false"
+    )
+    # Enqueue only the failed students — no duplicates to successful ones
+    for student_id in failed_students:
+        enqueue(queue="notifications.bulk", payload={
+            job_id:     job_id + "_retry",
+            student_id: student_id,
+            attempt:    2
+        })
+    return { requeued: failed_students.length }
+```
+
+---
+
+### 5.3 Supporting DB Table: `notification_delivery_log`
+
+```sql
+CREATE TABLE notification_delivery_log (
+    id              VARCHAR(36)     PRIMARY KEY DEFAULT gen_random_uuid(),
+    bulk_job_id     VARCHAR(36)     NOT NULL,
+    student_id      VARCHAR(36)     NOT NULL,
+    db_saved        BOOLEAN         NOT NULL DEFAULT FALSE,
+    email_sent      BOOLEAN         NOT NULL DEFAULT FALSE,
+    sse_pushed      BOOLEAN         NOT NULL DEFAULT FALSE,
+    failure_reason  TEXT,
+    attempt_count   INTEGER         NOT NULL DEFAULT 1,
+    processed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    UNIQUE (bulk_job_id, student_id)   -- idempotency constraint
+);
+```
+
+---
+
+## 6. Key Design Principles Applied
+
+| Principle | How It Is Applied |
+|-----------|------------------|
+| **Write-first** | DB is saved before email is sent — DB is always the source of truth |
+| **Async decoupling** | Email sending is offloaded to a queue — the API returns instantly |
+| **Idempotency** | `UNIQUE (bulk_job_id, student_id)` prevents duplicate processing on retry |
+| **Graceful degradation** | SSE failure is non-fatal; email failure is logged but DB record persists |
+| **Retry with backoff** | Email failures retry 3 times with exponential backoff before going to DLQ |
+| **Observability** | Every outcome is logged — HR can see exactly how many succeeded and failed |
+| **Targeted recovery** | Re-send endpoint retries only the failed 200, not all 50,000 |
+
+---
+
+## 7. Original vs. Redesigned: Side-by-Side
+
+| Dimension | Original | Redesigned |
+|-----------|----------|------------|
+| Delivery time for 50,000 | ~4.4 hours (sequential) | ~2–5 minutes (parallel workers) |
+| HR waits for completion | Yes — request blocks | No — returns instantly with job ID |
+| 200 email failures | Lost, unrecoverable | Logged, retryable for exactly those 200 |
+| DB + email consistency | Split-brain possible | Write-first guarantees DB is source of truth |
+| Duplicate notifications on retry | Yes | No — idempotency key prevents duplicates |
+| Rate limit handling | None — crashes | Requeue with delay on 429 |
+| Offline students miss in-app | Yes | No — DB record persists, loaded on next visit |
+| System observable | No | Yes — per-student delivery status tracked |
+
+---
+
+*Document version: 5.0 — June 9, 2026*
