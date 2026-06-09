@@ -1676,3 +1676,324 @@ This index allows PostgreSQL to jump directly to all `placement` rows and then s
 ---
 
 *Document version: 3.0 — June 9, 2026*
+
+---
+
+---
+
+# Stage 4: Performance at Scale — Caching, Load Reduction & Delivery Strategies
+
+> **Context:** Notifications are being fetched from the database on every page load for every student. With 50,000 students and 5,000,000 notifications, the database is overwhelmed, causing slow response times and poor user experience. This section diagnoses the architectural problem and proposes a layered set of solutions with honest tradeoff analysis for each.
+
+---
+
+## 1. Diagnosing the Root Problem
+
+Fetching from the database on every page load is the core architectural mistake. Here is what happens at scale:
+
+```
+50,000 students × average 5 page loads/hour
+= 250,000 DB queries/hour
+= ~70 queries/second sustained
+```
+
+During peak hours (morning login, placement result announcements) this spikes to several hundred queries per second. Each query hits the disk, competes for DB connections, and adds latency. The database — designed for persistence, not high-frequency reads — becomes the bottleneck.
+
+The solution is not to make the database faster. The solution is to **stop asking the database the same question repeatedly**.
+
+---
+
+## 2. Strategy 1: Server-Side Caching with Redis
+
+### What It Is
+
+Instead of querying PostgreSQL on every request, the application checks Redis first. Redis stores the result of recent notification queries in memory. A DB query only happens on a cache miss.
+
+```
+Request → Check Redis
+              │
+      ┌───────┴────────┐
+   HIT (fast)       MISS (slow)
+      │                │
+  Return cached    Query PostgreSQL
+  response         → Store in Redis
+  (~1ms)           → Return response
+                   (~50ms, once)
+```
+
+### Implementation
+
+```
+Cache key:   notif:list:<student_id>:unread:page:1
+Cache value: JSON array of notification objects
+TTL:         60 seconds
+```
+
+On every write operation (new notification inserted, marked as read, deleted), the relevant cache key is invalidated:
+
+```
+INSERT notification for student_id=1042
+  → DEL notif:list:1042:*          (invalidate all pages for this student)
+  → HINCRBY notif:unread:1042 total 1
+
+PATCH /notifications/:id/read
+  → DEL notif:list:1042:*
+  → HINCRBY notif:unread:1042 total -1
+```
+
+### Tradeoffs
+
+| Benefit | Cost |
+|---------|------|
+| Dramatically reduces DB load — cache hit rate of 80–95% is realistic | Adds Redis as an infrastructure dependency to operate and monitor |
+| Sub-millisecond response on cache hits | Cache invalidation logic must be maintained — bugs here cause stale data shown to users |
+| Scales horizontally — multiple app servers share one Redis | Students could briefly see slightly outdated notifications within the TTL window |
+| Unread count badge becomes nearly free (HGETALL on Redis) | Memory cost — Redis stores data in RAM, which is expensive at high volume |
+
+### When Stale Data Is Acceptable
+
+For notification lists, a 30–60 second TTL is generally acceptable — if a notification arrives and the student sees it 45 seconds later instead of instantly, the SSE stream (from Stage 1) will have already pushed it to the UI in real time. The REST API cache is for the initial page load, not for live delivery.
+
+---
+
+## 3. Strategy 2: Client-Side Caching with HTTP Cache Headers
+
+### What It Is
+
+The server instructs the browser to cache the notification response locally. On the next page load, the browser serves the cached response without making a network request at all.
+
+### Implementation
+
+Add these response headers to `GET /notifications`:
+
+```http
+HTTP/1.1 200 OK
+Cache-Control: private, max-age=30
+ETag: "a3f8b2c1d4e5f6a7"
+Last-Modified: Tue, 09 Jun 2026 09:00:00 GMT
+```
+
+On the next request, the browser sends:
+
+```http
+GET /notifications?status=unread HTTP/1.1
+If-None-Match: "a3f8b2c1d4e5f6a7"
+```
+
+If nothing has changed, the server responds with `304 Not Modified` and an empty body — saving bandwidth and DB load. The browser uses its cached copy.
+
+For the ETag, compute a hash of the student's latest `updated_at` timestamp:
+
+```sql
+SELECT MAX(updated_at) FROM notifications
+WHERE student_id = :student_id
+  AND isread = false;
+```
+
+Hash that value → use as ETag. This is a lightweight query compared to fetching all notifications.
+
+### Tradeoffs
+
+| Benefit | Cost |
+|---------|------|
+| Zero server load on cache hit — request never reaches the application | Only works for the same student on the same browser/device |
+| No extra infrastructure required — built into HTTP | `private` cache means CDNs cannot cache it (notifications are user-specific) |
+| Reduces network bandwidth significantly | Requires ETag computation logic on the server |
+| Works automatically with the browser's native cache | Browser cache can be cleared by the user, defeating the strategy |
+| Complements server-side caching — both can work together | `max-age=30` means UI could be 30 seconds stale without a revalidation request |
+
+---
+
+## 4. Strategy 3: Stop Fetching on Every Page Load — Event-Driven Updates
+
+### What It Is
+
+The most impactful change is architectural: **stop polling the database on page load entirely**. Instead, load notifications once on login and keep them updated in real time via the SSE stream already designed in Stage 1.
+
+### Current (Broken) Pattern
+
+```
+Page Load → GET /notifications (DB hit)
+Page Load → GET /notifications (DB hit)
+Page Load → GET /notifications (DB hit)
+... repeated indefinitely
+```
+
+### Proposed Pattern
+
+```
+Login → GET /notifications (one DB hit, result cached in app state)
+      → Open SSE /notifications/stream
+
+New notification arrives via SSE
+  → Prepend to local state (no DB call)
+
+Student marks as read
+  → PATCH /notifications/:id/read (one DB write)
+  → Update local state optimistically
+
+Page navigation
+  → Serve from local in-memory state (zero DB calls)
+```
+
+### Implementation on the Frontend
+
+Maintain a client-side notification store (e.g. Redux, Zustand, or a React context) that is populated once on login and updated only via SSE events and explicit user actions:
+
+```javascript
+// On login: single fetch, store in memory
+const { data } = await fetch('/v1/notifications?per_page=50');
+notificationStore.set(data);
+
+// On SSE event: update store in memory, no new API call
+eventSource.addEventListener('notification.new', (e) => {
+  const notification = JSON.parse(e.data);
+  notificationStore.prepend(notification);   // zero DB calls
+});
+
+// On page navigation: read from store, zero API calls
+function renderNotificationBell() {
+  return notificationStore.getUnreadCount();  // instant, in-memory
+}
+```
+
+### Tradeoffs
+
+| Benefit | Cost |
+|---------|------|
+| Eliminates repeated DB hits entirely for page navigation | Requires frontend state management discipline — store must be kept consistent |
+| Notifications feel instant — SSE delivers in under 100ms | If SSE connection drops, store becomes stale until reconnect |
+| Reduces server load by the largest margin of any strategy | Initial page load is slightly heavier (fetching 50 notifications upfront) |
+| Better UX — no loading spinner on every navigation | Multi-tab consistency requires care — tab A marking as read must update tab B via SSE |
+| Aligns with how modern SPAs (React, Vue) are designed | Requires frontend team to implement and maintain the store logic |
+
+---
+
+## 5. Strategy 4: Pagination + Lazy Loading (Stop Fetching Everything)
+
+### What It Is
+
+Even when the DB is queried, never fetch all notifications at once. Fetch only what is visible, and load more only when the student scrolls or requests it.
+
+### Implementation
+
+The API already supports pagination (from Stage 1). The frontend must use it:
+
+```
+Initial load:  GET /notifications?per_page=20&page=1
+Scroll to end: GET /notifications?per_page=20&page=2
+Scroll to end: GET /notifications?per_page=20&page=3
+```
+
+Better yet — use cursor-based pagination (from Stage 2) so deep pages remain fast:
+
+```
+Initial load:  GET /notifications?per_page=20
+Next page:     GET /notifications?per_page=20&cursor=<last_id>
+```
+
+### Tradeoffs
+
+| Benefit | Cost |
+|---------|------|
+| Massively reduces data transfer per request | UI must handle incremental loading (infinite scroll or "load more" button) |
+| DB queries are cheap — 20 rows vs 500 rows | Total notifications count still requires a COUNT query |
+| Works independently of caching — benefits stack | Pagination state must be managed on the frontend |
+| Reduces memory pressure on both server and client | Cursor-based pagination makes jumping to a specific page harder |
+
+---
+
+## 6. Strategy 5: Read Replica for Read Queries
+
+### What It Is
+
+PostgreSQL supports streaming replication — a read replica is a live copy of the primary database that receives all writes but handles all read queries. The notification fetch queries are routed to the replica; only writes (insert, update, delete) go to the primary.
+
+```
+Write operations  →  Primary DB (PostgreSQL)
+                           │
+                    Streaming replication
+                           │
+Read operations   →  Read Replica (PostgreSQL)
+```
+
+### Tradeoffs
+
+| Benefit | Cost |
+|---------|------|
+| Primary DB is completely free from read load | Replication lag — replica can be 10–500ms behind primary |
+| Read replica can be scaled independently | Adds infrastructure cost — another database server to operate |
+| No application logic changes required — just a connection string change | Application must route reads and writes to different connections |
+| Replica can serve as a hot standby for failover | A student who just marked a notification as read might briefly see it as unread on the next fetch (replica lag) |
+
+Replication lag is the key tradeoff to communicate to the team. For notification lists it is generally acceptable — for the unread count badge (where accuracy matters more), continue serving from Redis rather than the replica.
+
+---
+
+## 7. Recommended Implementation Order
+
+Not all strategies should be implemented at once. Apply them in order of impact vs. effort:
+
+| Priority | Strategy | Impact | Effort | When to Apply |
+|----------|----------|--------|--------|---------------|
+| 1 | **Event-driven updates (SSE + client store)** | Highest | Medium | Immediately — eliminates the root cause |
+| 2 | **Redis server-side cache** | High | Medium | Immediately — protects DB from bursts |
+| 3 | **Pagination + lazy loading** | High | Low | Immediately — already designed in Stage 1/2 |
+| 4 | **HTTP Cache-Control headers** | Medium | Low | Short term — easy win, no new infrastructure |
+| 5 | **Read replica** | Medium | High | When DB write load also becomes a bottleneck |
+
+---
+
+## 8. Combined Architecture After All Strategies Applied
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Student Browser                       │
+│                                                             │
+│  Notification Store (in-memory)                             │
+│  ├── Populated once on login via REST                       │
+│  ├── Updated in real time via SSE                           │
+│  └── Served instantly on every page navigation              │
+└────────────┬────────────────────────┬───────────────────────┘
+             │ REST (initial load     │ SSE (real-time
+             │ + explicit actions)    │ push events)
+             ▼                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      API Server                              │
+│                                                             │
+│  1. Check Redis cache                                       │
+│  2. Cache hit  → return instantly                           │
+│  3. Cache miss → query Read Replica → cache result          │
+│  4. Writes     → Primary DB → invalidate cache              │
+└──────────┬──────────────────────────┬───────────────────────┘
+           │ Reads                    │ Writes
+           ▼                          ▼
+  ┌─────────────────┐      ┌─────────────────────┐
+  │   Redis Cache   │      │  PostgreSQL Primary  │
+  │                 │      │  (writes only)       │
+  │  • Notif lists  │      └──────────┬──────────┘
+  │  • Unread counts│                 │ Replication
+  └─────────────────┘                 ▼
+                             ┌─────────────────────┐
+                             │  PostgreSQL Replica  │
+                             │  (reads only)        │
+                             └─────────────────────┘
+```
+
+---
+
+## 9. Stage 4 Summary
+
+| Strategy | Core Idea | Biggest Tradeoff |
+|----------|-----------|-----------------|
+| Redis server-side cache | Answer from memory, not disk | Cache invalidation complexity |
+| HTTP Cache-Control | Browser caches the response | Only works per-device, can go stale |
+| Event-driven SSE + client store | Fetch once, update via push | Frontend state management overhead |
+| Pagination + lazy loading | Never fetch more than you show | UI must handle incremental loading |
+| Read replica | Separate read and write load | Replication lag, extra infrastructure |
+
+The single most impactful change is **stopping the fetch-on-every-page-load pattern** by combining the SSE stream (already designed) with a client-side notification store. Every other strategy reduces DB load at the margins — this one eliminates the root cause.
+
+---
+
+*Document version: 4.0 — June 9, 2026*
