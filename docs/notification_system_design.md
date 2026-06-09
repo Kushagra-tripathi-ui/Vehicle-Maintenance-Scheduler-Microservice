@@ -771,3 +771,908 @@ function onLogout() {
 ---
 
 *Document version: 1.0 — June 9, 2026*
+
+---
+
+---
+
+# Stage 2: Persistent Storage — Database Design, Scalability & Queries
+
+> **Purpose:** Defines the storage layer that backs the Stage 1 REST API — database choice rationale, full schema, scalability problems and their solutions, and the exact queries each endpoint executes.
+
+---
+
+## 1. Storage Choice: PostgreSQL (Primary) + Redis (Cache Layer)
+
+### 1.1 Why PostgreSQL?
+
+| Criteria | Evaluation |
+|----------|------------|
+| **Data structure** | Notifications are structured, relational records with predictable fields — a perfect fit for relational schemas |
+| **ACID compliance** | Critical for `mark as read` and `delete` operations — partial writes must never leave data inconsistent |
+| **JSONB support** | The `metadata` and `actor`/`resource` fields are semi-structured; PostgreSQL's native `JSONB` column stores them efficiently with indexing support |
+| **Rich query support** | Filtering by `type`, `priority`, `status`, date ranges, and pagination are all first-class SQL operations |
+| **Partitioning** | PostgreSQL supports declarative table partitioning by range (e.g. `created_at`) — essential for managing billions of rows at scale |
+| **Maturity & ecosystem** | Battle-tested, excellent Spring Boot / JPA integration, strong tooling |
+
+**Alternatives considered and rejected:**
+
+- **MongoDB:** Semi-structured `metadata` field could suggest NoSQL, but the rest of the schema is rigidly relational. Using MongoDB would sacrifice joins and transactions for a flexibility we only need in one column — JSONB gives us that flexibility within PostgreSQL.
+- **Cassandra:** Excellent for write-heavy time-series at extreme scale, but operationally complex and poor for the ad-hoc filtering patterns our APIs require (by type, priority, read status simultaneously).
+
+### 1.2 Why Redis as a Cache Layer?
+
+Redis sits alongside PostgreSQL to serve two specific needs:
+
+| Use case | Detail |
+|----------|--------|
+| **Unread count cache** | `GET /notifications/unread-count` is called very frequently (badge polling + post-read updates). Computing `COUNT(*)` on millions of rows on every request is expensive. Redis stores a per-user counter that is incremented/decremented atomically. |
+| **SSE session registry** | Tracks which users have active SSE connections on which server instances — required for horizontally scaled deployments to route push events to the right server. |
+
+---
+
+## 2. Database Schema
+
+### 2.1 Entity Relationship Overview
+
+```
+users (external — referenced by ID only)
+  │
+  ├──< notifications (core table)
+  │         │
+  │         └── partitioned by created_at (monthly)
+  │
+  ├──< notification_preferences (one row per user)
+  │
+  └──< notification_type_preferences (per user per type)
+```
+
+---
+
+### 2.2 Table: `notifications`
+
+This is the core table. Every row is one notification delivered to one recipient.
+
+```sql
+CREATE TABLE notifications (
+    id                VARCHAR(36)     NOT NULL,                  -- e.g. notif_01HZ9X4K...
+    recipient_id      VARCHAR(36)     NOT NULL,                  -- user who receives this
+    actor_id          VARCHAR(36),                               -- user who triggered it (nullable for SYSTEM)
+    actor_name        VARCHAR(255),
+    actor_avatar_url  TEXT,
+
+    type              VARCHAR(50)     NOT NULL,                  -- COMMENT | MENTION | SYSTEM | ALERT | REMINDER | PROMOTION
+    priority          VARCHAR(20)     NOT NULL DEFAULT 'MEDIUM', -- LOW | MEDIUM | HIGH | URGENT
+    channel           VARCHAR(20)     NOT NULL DEFAULT 'IN_APP', -- IN_APP | EMAIL | PUSH | SMS
+
+    title             VARCHAR(512)    NOT NULL,
+    body              TEXT            NOT NULL,
+
+    resource_type     VARCHAR(50),                               -- POST | COMMENT | TASK | INVOICE | SYSTEM
+    resource_id       VARCHAR(36),
+    resource_url      TEXT,
+
+    metadata          JSONB           NOT NULL DEFAULT '{}',
+
+    is_read           BOOLEAN         NOT NULL DEFAULT FALSE,
+    is_archived       BOOLEAN         NOT NULL DEFAULT FALSE,
+    is_deleted        BOOLEAN         NOT NULL DEFAULT FALSE,    -- soft delete flag
+
+    read_at           TIMESTAMPTZ,
+    expires_at        TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (id, created_at)                                 -- composite PK required for partitioning
+) PARTITION BY RANGE (created_at);
+```
+
+**Monthly partitions (create ahead of time or automate with pg_partman):**
+
+```sql
+CREATE TABLE notifications_2026_06
+    PARTITION OF notifications
+    FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+
+CREATE TABLE notifications_2026_07
+    PARTITION OF notifications
+    FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+
+-- Continue for each month...
+```
+
+---
+
+### 2.3 Table: `notification_preferences`
+
+One row per user — stores global channel toggles, quiet hours, and digest settings.
+
+```sql
+CREATE TABLE notification_preferences (
+    user_id             VARCHAR(36)     PRIMARY KEY,
+
+    -- Global channel toggles
+    channel_in_app      BOOLEAN         NOT NULL DEFAULT TRUE,
+    channel_email       BOOLEAN         NOT NULL DEFAULT TRUE,
+    channel_push        BOOLEAN         NOT NULL DEFAULT FALSE,
+    channel_sms         BOOLEAN         NOT NULL DEFAULT FALSE,
+
+    -- Quiet hours
+    quiet_hours_enabled BOOLEAN         NOT NULL DEFAULT FALSE,
+    quiet_hours_start   TIME,                                    -- e.g. '22:00:00'
+    quiet_hours_end     TIME,                                    -- e.g. '08:00:00'
+    quiet_hours_tz      VARCHAR(100)    NOT NULL DEFAULT 'UTC',  -- IANA timezone
+
+    -- Digest
+    digest_enabled      BOOLEAN         NOT NULL DEFAULT FALSE,
+    digest_frequency    VARCHAR(20),                             -- DAILY | WEEKLY
+    digest_time         TIME,                                    -- e.g. '08:00:00'
+
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+```
+
+---
+
+### 2.4 Table: `notification_type_preferences`
+
+Per-user, per-type channel overrides. Only rows that differ from the global default need to exist.
+
+```sql
+CREATE TABLE notification_type_preferences (
+    user_id         VARCHAR(36)     NOT NULL,
+    notification_type VARCHAR(50)   NOT NULL,                   -- COMMENT | MENTION | SYSTEM | ALERT | REMINDER | PROMOTION
+
+    channel_in_app  BOOLEAN         NOT NULL DEFAULT TRUE,
+    channel_email   BOOLEAN         NOT NULL DEFAULT TRUE,
+    channel_push    BOOLEAN         NOT NULL DEFAULT FALSE,
+    channel_sms     BOOLEAN         NOT NULL DEFAULT FALSE,
+
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (user_id, notification_type)
+);
+```
+
+---
+
+### 2.5 Indexes
+
+```sql
+-- Most critical: fetch unread notifications for a user, newest first
+CREATE INDEX idx_notifications_recipient_read_created
+    ON notifications (recipient_id, is_read, created_at DESC)
+    WHERE is_deleted = FALSE;
+
+-- Filter by type
+CREATE INDEX idx_notifications_recipient_type
+    ON notifications (recipient_id, type, created_at DESC)
+    WHERE is_deleted = FALSE;
+
+-- Filter by priority
+CREATE INDEX idx_notifications_recipient_priority
+    ON notifications (recipient_id, priority, created_at DESC)
+    WHERE is_deleted = FALSE;
+
+-- Expiry cleanup job
+CREATE INDEX idx_notifications_expires_at
+    ON notifications (expires_at)
+    WHERE expires_at IS NOT NULL AND is_deleted = FALSE;
+
+-- JSONB metadata queries (if needed later)
+CREATE INDEX idx_notifications_metadata
+    ON notifications USING GIN (metadata);
+```
+
+---
+
+## 3. Scalability Problems & Solutions
+
+As the platform grows from thousands to millions of users, the following problems will arise:
+
+---
+
+### Problem 1: Table Size — Billions of Rows
+
+**What happens:** With 1M users each receiving 10 notifications/day, the `notifications` table grows by ~10M rows/day — 3.6B rows/year. Full table scans become catastrophically slow.
+
+**Solution: Range Partitioning by `created_at`**
+
+Already built into the schema above. Each monthly partition is a separate physical table. Queries that include a `created_at` filter (e.g. `since=`) touch only the relevant partition(s) — this is called **partition pruning**.
+
+```sql
+-- PostgreSQL automatically routes this to only the June 2026 partition
+SELECT * FROM notifications
+WHERE recipient_id = 'usr_123'
+  AND created_at >= '2026-06-01'
+  AND is_deleted = FALSE
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Old partitions (e.g. older than 90 days) can be **dropped instantly** with `DROP TABLE notifications_2026_03` — far faster than `DELETE`.
+
+---
+
+### Problem 2: Slow Unread Count Queries
+
+**What happens:** `COUNT(*) WHERE is_read = FALSE` scans potentially millions of rows per user on every badge poll.
+
+**Solution: Redis Counter Cache**
+
+Maintain a Redis hash per user:
+
+```
+Key:   notif:unread:<user_id>
+Value: { "total": 12, "COMMENT": 5, "MENTION": 3, "SYSTEM": 2, "ALERT": 2 }
+```
+
+- **On new notification insert:** `HINCRBY notif:unread:usr_123 total 1` and `HINCRBY notif:unread:usr_123 COMMENT 1`
+- **On mark as read:** decrement the relevant counters
+- **On mark all as read:** `DEL notif:unread:usr_123` and recompute from DB once
+- **Cache miss / first login:** compute from DB and populate Redis
+
+This reduces `GET /notifications/unread-count` to a single Redis `HGETALL` — sub-millisecond response.
+
+---
+
+### Problem 3: Slow Pagination at Deep Offsets
+
+**What happens:** `LIMIT 20 OFFSET 2000` requires the DB to scan and discard 2000 rows before returning results — gets progressively slower at deeper pages.
+
+**Solution: Cursor-Based Pagination**
+
+Replace `page` + `offset` with a `cursor` (the `created_at` + `id` of the last seen row):
+
+```sql
+-- Instead of OFFSET, use a WHERE clause on the last seen values
+SELECT * FROM notifications
+WHERE recipient_id = 'usr_123'
+  AND is_deleted = FALSE
+  AND (created_at, id) < ('2026-06-09T08:30:00Z', 'notif_01HZ...')
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+This is O(log n) regardless of how deep the page is. The API response includes a `next_cursor` token (base64-encoded `created_at:id`) for the client to pass in the next request.
+
+---
+
+### Problem 4: Write Contention on High-Volume Inserts
+
+**What happens:** Burst notification events (e.g. a viral post triggering 100K mention notifications simultaneously) overwhelm the DB with concurrent inserts.
+
+**Solution: Async Write Queue**
+
+Introduce a message queue (e.g. RabbitMQ or Kafka) between the notification producer and the DB writer:
+
+```
+Event Producer → Kafka Topic: notifications.pending
+                      ↓
+              Notification Worker
+           (batched DB inserts, Redis updates)
+                      ↓
+              PostgreSQL + Redis
+```
+
+Workers consume from the queue and perform **batch inserts** (`INSERT INTO notifications VALUES (...), (...), (...)`) — far more efficient than one insert per notification. The API remains fast; delivery becomes eventually consistent (typically within milliseconds).
+
+---
+
+### Problem 5: Old Data Accumulating Indefinitely
+
+**What happens:** Users accumulate thousands of old, read notifications that are never cleaned up, bloating storage and slowing queries.
+
+**Solution: TTL-Based Archival & Partition Drops**
+
+Three-tier retention policy:
+
+| Tier | Age | Action |
+|------|-----|--------|
+| Active | 0–30 days | Fully queryable in hot partitions |
+| Archived | 30–90 days | Moved to cheaper cold storage / compressed partition |
+| Deleted | 90+ days | Partition dropped entirely |
+
+A nightly cleanup job also hard-deletes soft-deleted rows and expired notifications:
+
+```sql
+-- Run nightly via pg_cron
+DELETE FROM notifications
+WHERE is_deleted = TRUE
+   OR (expires_at IS NOT NULL AND expires_at < NOW());
+```
+
+---
+
+## 4. Queries Mapped to REST API Endpoints
+
+---
+
+### 4.1 `GET /notifications` — List Notifications
+
+```sql
+-- Base query (status=all, no filters)
+SELECT
+    id, type, priority, channel, title, body,
+    actor_id, actor_name, actor_avatar_url,
+    resource_type, resource_id, resource_url,
+    metadata, is_read, is_archived,
+    read_at, expires_at, created_at
+FROM notifications
+WHERE recipient_id  = :recipient_id
+  AND is_deleted    = FALSE
+ORDER BY created_at DESC
+LIMIT :per_page
+OFFSET (:page - 1) * :per_page;
+
+-- With status=unread filter
+SELECT ... FROM notifications
+WHERE recipient_id  = :recipient_id
+  AND is_read       = FALSE
+  AND is_deleted    = FALSE
+ORDER BY created_at DESC
+LIMIT :per_page OFFSET :offset;
+
+-- With type filter (e.g. type=COMMENT,MENTION)
+SELECT ... FROM notifications
+WHERE recipient_id  = :recipient_id
+  AND type          = ANY(:types)        -- pass as array: ARRAY['COMMENT','MENTION']
+  AND is_deleted    = FALSE
+ORDER BY created_at DESC
+LIMIT :per_page OFFSET :offset;
+
+-- With since filter
+SELECT ... FROM notifications
+WHERE recipient_id  = :recipient_id
+  AND created_at    > :since
+  AND is_deleted    = FALSE
+ORDER BY created_at DESC
+LIMIT :per_page OFFSET :offset;
+
+-- Total count for pagination meta (run alongside main query)
+SELECT COUNT(*) FROM notifications
+WHERE recipient_id  = :recipient_id
+  AND is_deleted    = FALSE;
+```
+
+---
+
+### 4.2 `GET /notifications/:id` — Get Single Notification
+
+```sql
+SELECT
+    id, type, priority, channel, title, body,
+    actor_id, actor_name, actor_avatar_url,
+    resource_type, resource_id, resource_url,
+    metadata, is_read, is_archived,
+    read_at, expires_at, created_at
+FROM notifications
+WHERE id            = :notification_id
+  AND recipient_id  = :recipient_id        -- security: ensure ownership
+  AND is_deleted    = FALSE;
+```
+
+---
+
+### 4.3 `PATCH /notifications/:id/read` — Mark Single as Read
+
+```sql
+UPDATE notifications
+SET
+    is_read    = TRUE,
+    read_at    = NOW(),
+    updated_at = NOW()
+WHERE id            = :notification_id
+  AND recipient_id  = :recipient_id
+  AND is_deleted    = FALSE
+  AND is_read       = FALSE               -- no-op if already read
+RETURNING id, is_read, read_at;
+```
+
+**Redis update (run after successful SQL):**
+```
+HINCRBY notif:unread:<recipient_id> total -1
+HINCRBY notif:unread:<recipient_id> <type> -1
+```
+
+---
+
+### 4.4 `POST /notifications/read-all` — Mark All as Read
+
+```sql
+-- Without scope filters
+UPDATE notifications
+SET
+    is_read    = TRUE,
+    read_at    = NOW(),
+    updated_at = NOW()
+WHERE recipient_id  = :recipient_id
+  AND is_read       = FALSE
+  AND is_deleted    = FALSE;
+
+-- With optional type filter
+UPDATE notifications
+SET
+    is_read    = TRUE,
+    read_at    = NOW(),
+    updated_at = NOW()
+WHERE recipient_id  = :recipient_id
+  AND is_read       = FALSE
+  AND is_deleted    = FALSE
+  AND type          = :type;
+
+-- With optional before filter
+UPDATE notifications
+SET
+    is_read    = TRUE,
+    read_at    = NOW(),
+    updated_at = NOW()
+WHERE recipient_id  = :recipient_id
+  AND is_read       = FALSE
+  AND is_deleted    = FALSE
+  AND created_at   <= :before;
+```
+
+**Redis update (run after):**
+```
+DEL notif:unread:<recipient_id>
+-- Counter will be lazily recomputed on next unread-count request
+```
+
+---
+
+### 4.5 `DELETE /notifications/:id` — Delete Notification
+
+```sql
+-- Soft delete (preferred — preserves audit trail)
+UPDATE notifications
+SET
+    is_deleted = TRUE,
+    updated_at = NOW()
+WHERE id            = :notification_id
+  AND recipient_id  = :recipient_id
+  AND is_deleted    = FALSE;
+```
+
+---
+
+### 4.6 `GET /notifications/unread-count` — Unread Badge Count
+
+**Step 1 — Try Redis first:**
+```
+HGETALL notif:unread:<recipient_id>
+```
+
+**Step 2 — Cache miss: compute from DB and populate Redis:**
+```sql
+SELECT
+    type,
+    COUNT(*) AS unread_count
+FROM notifications
+WHERE recipient_id  = :recipient_id
+  AND is_read       = FALSE
+  AND is_deleted    = FALSE
+GROUP BY type;
+```
+
+Then write to Redis:
+```
+HSET notif:unread:<recipient_id>
+     total   12
+     COMMENT  5
+     MENTION  3
+     SYSTEM   2
+     ALERT    2
+EXPIRE notif:unread:<recipient_id> 3600
+```
+
+---
+
+### 4.7 `GET /notifications/preferences` — Get Preferences
+
+```sql
+-- Fetch global preferences
+SELECT *
+FROM notification_preferences
+WHERE user_id = :user_id;
+
+-- Fetch per-type overrides
+SELECT notification_type, channel_in_app, channel_email, channel_push, channel_sms
+FROM notification_type_preferences
+WHERE user_id = :user_id;
+```
+
+These two results are merged in the application layer into the preferences JSON shape defined in Stage 1.
+
+---
+
+### 4.8 `PUT /notifications/preferences` — Update Preferences
+
+```sql
+-- Upsert global preferences (INSERT or UPDATE if exists)
+INSERT INTO notification_preferences (
+    user_id,
+    channel_in_app, channel_email, channel_push, channel_sms,
+    quiet_hours_enabled, quiet_hours_start, quiet_hours_end, quiet_hours_tz,
+    digest_enabled, digest_frequency, digest_time,
+    updated_at
+)
+VALUES (
+    :user_id,
+    :channel_in_app, :channel_email, :channel_push, :channel_sms,
+    :quiet_hours_enabled, :quiet_hours_start, :quiet_hours_end, :quiet_hours_tz,
+    :digest_enabled, :digest_frequency, :digest_time,
+    NOW()
+)
+ON CONFLICT (user_id) DO UPDATE SET
+    channel_in_app      = EXCLUDED.channel_in_app,
+    channel_email       = EXCLUDED.channel_email,
+    channel_push        = EXCLUDED.channel_push,
+    channel_sms         = EXCLUDED.channel_sms,
+    quiet_hours_enabled = EXCLUDED.quiet_hours_enabled,
+    quiet_hours_start   = EXCLUDED.quiet_hours_start,
+    quiet_hours_end     = EXCLUDED.quiet_hours_end,
+    quiet_hours_tz      = EXCLUDED.quiet_hours_tz,
+    digest_enabled      = EXCLUDED.digest_enabled,
+    digest_frequency    = EXCLUDED.digest_frequency,
+    digest_time         = EXCLUDED.digest_time,
+    updated_at          = NOW();
+
+-- Upsert per-type overrides (called once per type in the request body)
+INSERT INTO notification_type_preferences (
+    user_id, notification_type,
+    channel_in_app, channel_email, channel_push, channel_sms,
+    updated_at
+)
+VALUES (
+    :user_id, :notification_type,
+    :channel_in_app, :channel_email, :channel_push, :channel_sms,
+    NOW()
+)
+ON CONFLICT (user_id, notification_type) DO UPDATE SET
+    channel_in_app  = EXCLUDED.channel_in_app,
+    channel_email   = EXCLUDED.channel_email,
+    channel_push    = EXCLUDED.channel_push,
+    channel_sms     = EXCLUDED.channel_sms,
+    updated_at      = NOW();
+```
+
+---
+
+## 5. Storage Architecture Summary
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    REST API Layer                        │
+└───────────┬─────────────────────────┬───────────────────┘
+            │                         │
+            ▼                         ▼
+    ┌───────────────┐         ┌───────────────┐
+    │     Redis     │         │  PostgreSQL   │
+    │               │         │               │
+    │ • Unread      │         │ • notifications│
+    │   counters    │         │   (partitioned)│
+    │ • SSE session │         │ • preferences │
+    │   registry    │         │ • type_prefs  │
+    └───────────────┘         └───────────────┘
+                                      │
+                              ┌───────┴────────┐
+                              │  Monthly       │
+                              │  Partitions    │
+                              │  2026_06       │
+                              │  2026_07  ...  │
+                              └────────────────┘
+```
+
+---
+
+*Document version: 2.0 — June 9, 2026*
+
+---
+
+---
+
+# Stage 3: Query Analysis, Indexing Strategy & Optimization
+
+> **Context:** The notifications table has grown to **50,000 students** and **50 lakh (5,000,000) notifications**. A query written three months ago to fetch unread notifications per student is now performing slowly. This section diagnoses the problem, fixes it, and answers related indexing and query design questions.
+
+---
+
+## 1. The Original Query
+
+```sql
+Select * from notifications where student_id=1042 and isread=false orderby createdAt desc;
+```
+
+---
+
+## 2. Is This Query Accurate?
+
+**Mostly yes — but it has two syntax errors that would prevent it from running at all on a strict SQL engine:**
+
+| Issue | In the query | Correct syntax |
+|-------|-------------|----------------|
+| Missing space in `ORDER BY` | `orderby` | `ORDER BY` |
+| Wrong column name casing | `createdAt` | `created_at` (assuming snake_case schema as defined in Stage 2) |
+
+**Corrected query:**
+
+```sql
+SELECT * FROM notifications
+WHERE student_id = 1042
+  AND isread = false
+ORDER BY created_at DESC;
+```
+
+This is logically correct — it fetches all unread notifications for a specific student, newest first. However, correctness and performance are two different things, which brings us to the next problem.
+
+---
+
+## 3. Why Is This Query Slow?
+
+With 5,000,000 rows in the table, this query is slow for the following reasons:
+
+### Reason 1: Full Table Scan (No Index)
+
+If no index exists on `student_id` or `isread`, PostgreSQL has no choice but to scan **every single row** in the table — all 5 million of them — to find the ones matching `student_id = 1042 AND isread = false`. This is called a **Sequential Scan (Seq Scan)**.
+
+```
+Seq Scan on notifications
+  Filter: ((student_id = 1042) AND (isread = false))
+  Rows removed by filter: ~4,999,950
+```
+
+It reads 5M rows to return perhaps 30. That is the core problem.
+
+### Reason 2: `SELECT *` Fetches Every Column
+
+`SELECT *` forces PostgreSQL to read every column for every matching row — including wide columns like `body` (TEXT), `metadata` (JSONB), and `resource_url`. This increases I/O significantly, especially when the API only needs a subset of fields to render the notification list.
+
+### Reason 3: `ORDER BY created_at DESC` Without a Supporting Index
+
+Even after filtering, sorting the result set requires PostgreSQL to load all matching rows into memory and sort them. Without an index that already provides the data in sorted order, this becomes an in-memory sort operation — expensive as the unread count per student grows.
+
+### Reason 4: No LIMIT Clause
+
+The query fetches **all** unread notifications for the student in one shot. A student could have hundreds of unread notifications. The API only displays 20 at a time — fetching all of them is wasteful.
+
+---
+
+## 4. What Should You Change?
+
+### Fix 1: Add a Composite Index
+
+Create an index that covers all three operations in the query — filter by `student_id`, filter by `isread`, and sort by `created_at`:
+
+```sql
+CREATE INDEX idx_notifications_student_unread
+ON notifications (student_id, isread, created_at DESC)
+WHERE isread = false;
+```
+
+This is a **partial composite index** — the `WHERE isread = false` clause means the index only stores unread rows. This makes the index smaller, faster to build, and faster to search because read notifications (the majority over time) are excluded entirely.
+
+**What PostgreSQL does with this index:**
+
+```
+Index Scan using idx_notifications_student_unread on notifications
+  Index Cond: ((student_id = 1042) AND (isread = false))
+  -- Already sorted by created_at DESC — no separate sort step needed
+```
+
+It jumps directly to student 1042's unread rows, already in the right order. Zero full table scan.
+
+### Fix 2: Select Only Required Columns
+
+Replace `SELECT *` with only the columns the frontend actually needs:
+
+```sql
+SELECT
+    id, type, priority, title, body,
+    actor_id, actor_name, actor_avatar_url,
+    resource_type, resource_id, resource_url,
+    created_at, expires_at
+FROM notifications
+WHERE student_id = 1042
+  AND isread = false
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+This reduces the data read from disk and sent over the network on every request.
+
+### Fix 3: Add a LIMIT Clause
+
+Always paginate. Never fetch all rows in one query:
+
+```sql
+-- Page 1
+SELECT id, type, priority, title, body, ...
+FROM notifications
+WHERE student_id = 1042
+  AND isread = false
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 0;
+
+-- Better: cursor-based (as discussed in Stage 2)
+SELECT id, type, priority, title, body, ...
+FROM notifications
+WHERE student_id = 1042
+  AND isread = false
+  AND created_at < :last_seen_cursor
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+### The Fully Optimized Query
+
+```sql
+SELECT
+    id, type, priority, channel,
+    title, body,
+    actor_id, actor_name, actor_avatar_url,
+    resource_type, resource_id, resource_url,
+    metadata, created_at, expires_at
+FROM notifications
+WHERE student_id  = 1042
+  AND isread      = false
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+---
+
+## 5. Computational Cost: Before vs. After
+
+| Metric | Original Query | Optimized Query |
+|--------|---------------|-----------------|
+| **Scan type** | Sequential Scan (all 5M rows) | Index Scan (~30 rows for that student) |
+| **Rows examined** | ~5,000,000 | ~20–50 |
+| **Sort operation** | In-memory sort of all matching rows | Pre-sorted by index — no sort needed |
+| **Columns fetched** | All columns including heavy TEXT/JSONB | Only required columns |
+| **Rows returned** | All unread (unbounded) | 20 (paginated) |
+| **Time complexity** | O(n) — linear in table size | O(log n) — index B-tree lookup |
+| **Typical execution time** | 800ms–3s at 5M rows | 1ms–5ms |
+
+The index reduces the query from **O(n)** linear scan to **O(log n)** B-tree traversal — performance stops degrading as the table grows.
+
+---
+
+## 6. Should You Add Indexes on Every Column?
+
+**No. This is a common misconception and would actively harm performance.**
+
+Here is why indexing every column is a bad idea:
+
+### It Slows Down Every Write Operation
+
+Every `INSERT`, `UPDATE`, and `DELETE` on the `notifications` table must also update **every index** on that table. With 10+ indexes, inserting one notification becomes 10+ index update operations. On a high-volume notification system receiving thousands of inserts per minute, this write overhead compounds severely.
+
+```
+-- Without indexes: 1 write operation
+INSERT INTO notifications (...) VALUES (...);
+
+-- With 10 indexes: 11 write operations
+INSERT INTO notifications (...) VALUES (...);
+-- + update idx_1, idx_2, idx_3 ... idx_10
+```
+
+### Most Indexes Would Never Be Used
+
+Columns like `actor_avatar_url`, `resource_url`, `body`, and `title` are never used in `WHERE` clauses or `JOIN` conditions. An index on them wastes disk space and write performance with zero read benefit. PostgreSQL's query planner would ignore them entirely.
+
+### Indexes Consume Significant Disk Space
+
+Each index is a separate B-tree data structure on disk. At 5M rows, a single index can consume hundreds of megabytes. Indexing every column could multiply storage requirements by 5–10x.
+
+### The Right Approach: Index by Query Pattern
+
+Only add an index when you have a concrete query that needs it. The decision checklist:
+
+| Question | If Yes → |
+|----------|----------|
+| Is this column used in a `WHERE` clause frequently? | Consider indexing |
+| Is this column used in `ORDER BY` on large result sets? | Consider indexing |
+| Is this column used in a `JOIN` condition? | Consider indexing |
+| Is the column high-cardinality (many distinct values)? | Index is more effective |
+| Is this a write-heavy table? | Be conservative — fewer indexes |
+
+**Indexes to create for this system (and why):**
+
+```sql
+-- 1. Core read query: filter by student + read status + sort
+CREATE INDEX idx_notifications_student_unread
+ON notifications (student_id, isread, created_at DESC)
+WHERE isread = false;
+
+-- 2. Filter by notification type (placement queries, etc.)
+CREATE INDEX idx_notifications_student_type
+ON notifications (student_id, notification_type, created_at DESC);
+
+-- 3. Expiry cleanup job
+CREATE INDEX idx_notifications_expires_at
+ON notifications (expires_at)
+WHERE expires_at IS NOT NULL;
+```
+
+**Indexes NOT to create:**
+- On `body`, `title`, `actor_avatar_url`, `resource_url` — never queried in WHERE clauses
+- On `actor_name` — low selectivity, not filtered
+- On `metadata` (JSONB GIN index) — only if you have specific JSONB key queries, not by default
+
+---
+
+## 7. Placement Notifications in the Last 7 Days
+
+Find all students who received a placement notification in the last 7 days.
+
+### Query
+
+```sql
+SELECT DISTINCT student_id
+FROM notifications
+WHERE notification_type = 'placement'
+  AND created_at >= NOW() - INTERVAL '7 days';
+```
+
+### With Student Details (if a `students` table exists)
+
+```sql
+SELECT
+    s.id            AS student_id,
+    s.name          AS student_name,
+    s.email,
+    COUNT(n.id)     AS placement_notification_count,
+    MAX(n.created_at) AS latest_notification_at
+FROM notifications n
+JOIN students s ON s.id = n.student_id
+WHERE n.notification_type = 'placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days'
+GROUP BY s.id, s.name, s.email
+ORDER BY latest_notification_at DESC;
+```
+
+### With Full Notification Details Per Student
+
+```sql
+SELECT
+    n.student_id,
+    n.id            AS notification_id,
+    n.title,
+    n.body,
+    n.created_at
+FROM notifications n
+WHERE n.notification_type = 'placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days'
+ORDER BY n.student_id, n.created_at DESC;
+```
+
+### Supporting Index for This Query
+
+```sql
+CREATE INDEX idx_notifications_type_created
+ON notifications (notification_type, created_at DESC);
+```
+
+This index allows PostgreSQL to jump directly to all `placement` rows and then scan only those within the last 7 days — without touching unrelated notification types at all.
+
+**Without this index:** PostgreSQL scans all 5M rows, filters by type and date.
+**With this index:** PostgreSQL reads only placement rows in the last 7 days — a tiny fraction of the table.
+
+---
+
+## 8. Stage 3 Summary
+
+| Question | Answer |
+|----------|--------|
+| Is the original query accurate? | Syntactically broken (`orderby`, wrong casing). Logically correct but severely unoptimized. |
+| Why is it slow? | Full table scan across 5M rows, no index, `SELECT *`, no LIMIT |
+| What to change? | Partial composite index, select specific columns, add LIMIT/pagination |
+| Computational cost improvement | O(n) → O(log n); from ~2s to ~2ms |
+| Index every column? | No — destroys write performance, wastes disk, most indexes unused |
+| Correct indexing strategy | Index only columns used in WHERE, ORDER BY, and JOIN — by query pattern |
+
+---
+
+*Document version: 3.0 — June 9, 2026*
