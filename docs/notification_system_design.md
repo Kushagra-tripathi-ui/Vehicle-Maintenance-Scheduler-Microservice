@@ -2315,5 +2315,171 @@ CREATE TABLE notification_delivery_log (
 | System observable | No | Yes — per-student delivery status tracked |
 
 ---
+# Stage 6: Priority Inbox
+
+## Objective
+
+Introduce a Priority Inbox that always displays the top N most important unread notifications for a user.
+
+Users can choose the inbox size (10, 15, 20, etc.). Priority is determined by:
+
+1. Notification category weight
+2. Recency
+3. Unread status
+
+Only unread notifications participate in priority ranking.
+
+---
+
+## Priority Model
+
+The evaluation requirements define the following hierarchy:
+
+| Type      | Weight |
+| --------- | ------ |
+| Placement | 3      |
+| Result    | 2      |
+| Event     | 1      |
+
+A notification's priority score is calculated using both weight and recency.
+
+### Score Formula
+
+```text
+priority_score =
+(type_weight * 1,000,000)
++
+recency_score
+```
+
+Where:
+
+```text
+placement = 3
+result = 2
+event = 1
+```
+
+Recency score is derived from the notification timestamp.
+
+More recent notifications receive a higher recency score.
+
+This ensures:
+
+* Placement notifications rank highest.
+* Result notifications rank above Events.
+* Newer notifications rank higher within the same category.
+
+---
+
+## Top-N Selection Algorithm
+
+Sorting the entire notification list on every request is inefficient.
+
+Instead, a fixed-size Min Heap is maintained.
+
+### Process
+
+1. Fetch unread notifications from the Notification API.
+2. Compute priority score.
+3. Insert into Min Heap.
+4. Heap size is capped at N.
+5. If a new notification has a higher score than the heap minimum, replace it.
+
+### Complexity
+
+Let:
+
+```text
+M = total unread notifications
+N = requested priority inbox size
+```
+
+Time Complexity:
+
+```text
+O(M log N)
+```
+
+Space Complexity:
+
+```text
+O(N)
+```
+
+For Top-10:
+
+```text
+O(M log 10)
+```
+
+which is effectively linear.
+
+---
+
+## Handling Continuous Notification Arrival
+
+New notifications continuously arrive from the notification service.
+
+Instead of rebuilding the entire priority inbox:
+
+1. Calculate score for incoming notification.
+2. Compare with heap minimum.
+3. Replace minimum if incoming notification has higher priority.
+
+This provides:
+
+* Constant memory usage
+* Low latency updates
+* No full re-sort operation
+
+---
+
+## Example
+
+Unread notifications:
+
+| ID | Type      | Age    |
+| -- | --------- | ------ |
+| N1 | Placement | 5 min  |
+| N2 | Result    | 1 min  |
+| N3 | Event     | 30 sec |
+
+Scores:
+
+```text
+N1 = 3,000,000 + recency
+N2 = 2,000,000 + recency
+N3 = 1,000,000 + recency
+```
+
+Priority order:
+
+1. N1
+2. N2
+3. N3
+
+---
+
+## Scalability
+
+The design supports:
+
+* Millions of notifications
+* Configurable Top-N values
+* Streaming notification updates
+* Horizontal scaling
+
+Because only N records are maintained in memory, performance remains stable regardless of notification volume.
+
+---
+
+## Future Improvements
+
+1. User-personalized weighting.
+2. Machine-learning ranking.
+3. Priority decay over time.
+4. Category-specific inbox views.
+5. Redis caching of Priority Inbox results.
 
 *Document version: 5.0 — June 9, 2026*
